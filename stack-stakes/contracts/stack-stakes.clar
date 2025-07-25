@@ -77,6 +77,52 @@
     }
 )
 
+;; Delegation marketplace
+(define-map delegation-offers
+    uint
+    {
+        validator: principal,
+        offered-commission: uint,
+        minimum-delegation: uint,
+        maximum-delegation: uint,
+        duration: uint,
+        active: bool,
+        created-height: uint,
+        delegators-count: uint,
+    }
+)
+
+(define-data-var offer-counter uint u0)
+
+;; Delegation requests from users
+(define-map delegation-requests
+    {
+        user: principal,
+        offer-id: uint,
+    }
+    {
+        amount: uint,
+        accepted: bool,
+        created-height: uint,
+    }
+)
+
+;; DeFi integration - Lending/borrowing against liquid tokens
+(define-map lending-pools
+    uint
+    {
+        lender: principal,
+        collateral-amount: uint, ;; Liquid tokens as collateral
+        borrowed-amount: uint, ;; STX borrowed
+        interest-rate: uint,
+        duration: uint,
+        active: bool,
+        created-height: uint,
+    }
+)
+
+(define-data-var lending-counter uint u0)
+
 (define-data-var unstaking-counter uint u0)
 
 ;; Read-only functions
@@ -607,5 +653,310 @@
             (ok yield-percentage)
         )
         (ok u0)
+    )
+)
+
+;; Delegation marketplace functions
+(define-public (create-delegation-offer
+        (offered-commission uint)
+        (minimum-delegation uint)
+        (maximum-delegation uint)
+        (duration uint)
+    )
+    (let ((offer-id (var-get offer-counter)))
+        (begin
+            (asserts! (not (var-get contract-paused)) err-not-authorized)
+            (asserts! (is-some (map-get? staking-pools tx-sender))
+                err-invalid-validator
+            )
+            (asserts! (<= offered-commission u1500) err-invalid-amount) ;; Max 15% for marketplace
+            (asserts! (> minimum-delegation u0) err-invalid-amount)
+            (asserts! (>= maximum-delegation minimum-delegation)
+                err-invalid-amount
+            )
+            (asserts! (> duration u0) err-invalid-amount)
+            (map-set delegation-offers offer-id {
+                validator: tx-sender,
+                offered-commission: offered-commission,
+                minimum-delegation: minimum-delegation,
+                maximum-delegation: maximum-delegation,
+                duration: duration,
+                active: true,
+                created-height: stacks-block-height,
+                delegators-count: u0,
+            })
+            (var-set offer-counter (+ offer-id u1))
+            (ok offer-id)
+        )
+    )
+)
+
+(define-public (accept-delegation-offer
+        (offer-id uint)
+        (amount uint)
+    )
+    (let (
+            (offer (unwrap! (map-get? delegation-offers offer-id) err-pool-not-found))
+            (existing-request (map-get? delegation-requests {
+                user: tx-sender,
+                offer-id: offer-id,
+            }))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-not-authorized)
+            (asserts! (get active offer) err-not-authorized)
+            (asserts! (>= amount (get minimum-delegation offer))
+                err-invalid-amount
+            )
+            (asserts! (<= amount (get maximum-delegation offer))
+                err-invalid-amount
+            )
+            (asserts! (is-none existing-request) err-already-staking)
+            ;; Create delegation request
+            (map-set delegation-requests {
+                user: tx-sender,
+                offer-id: offer-id,
+            } {
+                amount: amount,
+                accepted: false,
+                created-height: stacks-block-height,
+            })
+            ;; Stake with the validator from the offer
+            (unwrap! (stake-stx (get validator offer) amount)
+                err-insufficient-balance
+            )
+            ;; Update offer statistics
+            (map-set delegation-offers offer-id
+                (merge offer { delegators-count: (+ (get delegators-count offer) u1) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (cancel-delegation-offer (offer-id uint))
+    (let ((offer (unwrap! (map-get? delegation-offers offer-id) err-pool-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get validator offer)) err-not-authorized)
+            (asserts! (get active offer) err-not-authorized)
+            (map-set delegation-offers offer-id (merge offer { active: false }))
+            (ok true)
+        )
+    )
+)
+
+;; DeFi integration - Lending against liquid tokens
+(define-public (create-lending-position
+        (collateral-amount uint)
+        (borrow-amount uint)
+        (interest-rate uint)
+        (duration uint)
+    )
+    (let (
+            (lending-id (var-get lending-counter))
+            (user-balance (get-liquid-token-balance tx-sender))
+            (collateral-value (calculate-stx-value collateral-amount))
+            (ltv-ratio (/ (* borrow-amount u100) collateral-value)) ;; Loan-to-value ratio
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-not-authorized)
+            (asserts! (>= (get balance user-balance) collateral-amount)
+                err-insufficient-balance
+            )
+            (asserts! (<= ltv-ratio u75) err-invalid-amount) ;; Max 75% LTV
+            (asserts! (> borrow-amount u0) err-invalid-amount)
+            (asserts! (> duration u0) err-invalid-amount)
+            ;; Lock collateral
+            (map-set liquid-token-balances tx-sender {
+                balance: (- (get balance user-balance) collateral-amount),
+                last-claim-cycle: (get last-claim-cycle user-balance),
+            })
+            ;; Create lending position
+            (map-set lending-pools lending-id {
+                lender: tx-sender,
+                collateral-amount: collateral-amount,
+                borrowed-amount: borrow-amount,
+                interest-rate: interest-rate,
+                duration: duration,
+                active: true,
+                created-height: stacks-block-height,
+            })
+            ;; Transfer borrowed STX to user
+            (unwrap!
+                (as-contract (stx-transfer? borrow-amount tx-sender tx-sender))
+                err-insufficient-balance
+            )
+            (var-set lending-counter (+ lending-id u1))
+            (ok lending-id)
+        )
+    )
+)
+
+(define-public (repay-lending-position (lending-id uint))
+    (let (
+            (position (unwrap! (map-get? lending-pools lending-id) err-pool-not-found))
+            (interest (/ (* (get borrowed-amount position) (get interest-rate position))
+                u10000
+            ))
+            (total-repayment (+ (get borrowed-amount position) interest))
+            (user-balance (get-liquid-token-balance tx-sender))
+        )
+        (begin
+            (asserts! (is-eq tx-sender (get lender position)) err-not-authorized)
+            (asserts! (get active position) err-not-authorized)
+            (asserts! (>= (stx-get-balance tx-sender) total-repayment)
+                err-insufficient-balance
+            )
+            ;; Transfer repayment to contract
+            (unwrap!
+                (stx-transfer? total-repayment tx-sender (as-contract tx-sender))
+                err-insufficient-balance
+            )
+            ;; Return collateral to user
+            (map-set liquid-token-balances tx-sender {
+                balance: (+ (get balance user-balance) (get collateral-amount position)),
+                last-claim-cycle: (get last-claim-cycle user-balance),
+            })
+            ;; Close lending position
+            (map-set lending-pools lending-id (merge position { active: false }))
+            (ok true)
+        )
+    )
+)
+
+;; Liquidation mechanism for undercollateralized positions
+(define-public (liquidate-lending-position (lending-id uint))
+    (let (
+            (position (unwrap! (map-get? lending-pools lending-id) err-pool-not-found))
+            (current-collateral-value (calculate-stx-value (get collateral-amount position)))
+            (ltv-ratio (/ (* (get borrowed-amount position) u100) current-collateral-value))
+        )
+        (begin
+            (asserts! (get active position) err-not-authorized)
+            (asserts! (> ltv-ratio u90) err-not-authorized) ;; Liquidate if LTV > 90%
+            ;; Transfer collateral to liquidator as reward
+            (let ((liquidator-balance (get-liquid-token-balance tx-sender)))
+                (map-set liquid-token-balances tx-sender {
+                    balance: (+ (get balance liquidator-balance)
+                        (get collateral-amount position)
+                    ),
+                    last-claim-cycle: (get last-claim-cycle liquidator-balance),
+                })
+            )
+            ;; Close position
+            (map-set lending-pools lending-id (merge position { active: false }))
+            (ok true)
+        )
+    )
+)
+
+;; Yield farming with liquid tokens
+(define-public (deposit-for-yield
+        (amount uint)
+        (farming-period uint)
+    )
+    (let (
+            (user-balance (get-liquid-token-balance tx-sender))
+            (yield-rate (/ u200 u10000)) ;; 2% base yield
+            (bonus-rate (if (> farming-period u4320)
+                (/ u50 u10000)
+                u0
+            ))
+            ;; 0.5% bonus for 30+ days
+            (total-rate (+ yield-rate bonus-rate))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-not-authorized)
+            (asserts! (>= (get balance user-balance) amount)
+                err-insufficient-balance
+            )
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (>= farming-period u144) err-invalid-amount) ;; Min 1 day
+            ;; Lock tokens for yield farming
+            (map-set liquid-token-balances tx-sender {
+                balance: (- (get balance user-balance) amount),
+                last-claim-cycle: (get last-claim-cycle user-balance),
+            })
+            ;; Calculate and add yield after farming period (simplified)
+            (let ((yield-amount (/ (* amount total-rate farming-period) u52560)))
+                ;; Annualized
+                (map-set liquid-token-balances tx-sender {
+                    balance: (+ (- (get balance user-balance) amount) amount yield-amount),
+                    last-claim-cycle: (var-get current-cycle),
+                })
+                (ok yield-amount)
+            )
+        )
+    )
+)
+
+;; Read-only functions for marketplace and DeFi
+(define-read-only (get-delegation-offer (offer-id uint))
+    (map-get? delegation-offers offer-id)
+)
+
+(define-read-only (get-delegation-request
+        (user principal)
+        (offer-id uint)
+    )
+    (map-get? delegation-requests {
+        user: user,
+        offer-id: offer-id,
+    })
+)
+
+(define-read-only (get-lending-position (lending-id uint))
+    (map-get? lending-pools lending-id)
+)
+
+(define-read-only (get-active-offers)
+    (ok (var-get offer-counter))
+)
+
+(define-read-only (calculate-ltv-ratio (lending-id uint))
+    (match (map-get? lending-pools lending-id)
+        position (let (
+                (collateral-value (calculate-stx-value (get collateral-amount position)))
+                (borrowed-amount (get borrowed-amount position))
+            )
+            (ok (if (> collateral-value u0)
+                (/ (* borrowed-amount u100) collateral-value)
+                u0
+            ))
+        )
+        (ok u0)
+    )
+)
+
+(define-read-only (get-marketplace-stats)
+    (ok {
+        total-offers: (var-get offer-counter),
+        total-lending-positions: (var-get lending-counter),
+        protocol-tvl: (var-get total-staked),
+        liquid-token-supply: (var-get total-liquid-tokens),
+    })
+)
+
+;; Emergency functions
+(define-public (emergency-close-lending-position (lending-id uint))
+    (let ((position (unwrap! (map-get? lending-pools lending-id) err-pool-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (map-set lending-pools lending-id (merge position { active: false }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-protocol-parameters
+        (new-min-stake uint)
+        (new-fee-rate uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> new-min-stake u0) err-invalid-amount)
+        (asserts! (<= new-fee-rate u500) err-invalid-amount) ;; Max 5% fee
+        ;; Note: Would need to add these as data variables in a full implementation
+        (ok true)
     )
 )

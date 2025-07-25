@@ -78,3 +78,65 @@
 )
 
 (define-data-var unstaking-counter uint u0)
+
+;; Read-only functions
+(define-read-only (get-staking-pool (validator principal))
+    (map-get? staking-pools validator)
+)
+
+(define-read-only (get-user-stake
+        (user principal)
+        (validator principal)
+    )
+    (map-get? user-stakes {
+        user: user,
+        validator: validator,
+    })
+)
+
+(define-read-only (get-liquid-token-balance (user principal))
+    (default-to {
+        balance: u0,
+        last-claim-cycle: u0,
+    }
+        (map-get? liquid-token-balances user)
+    )
+)
+
+(define-read-only (get-protocol-stats)
+    (ok {
+        total-staked: (var-get total-staked),
+        total-liquid-tokens: (var-get total-liquid-tokens),
+        exchange-rate: (var-get exchange-rate),
+        protocol-fees: (var-get protocol-fees),
+        current-cycle: (var-get current-cycle),
+    })
+)
+
+(define-read-only (calculate-liquid-tokens (stx-amount uint))
+    (/ (* stx-amount u1000000) (var-get exchange-rate))
+)
+
+(define-read-only (calculate-stx-value (liquid-tokens uint))
+    (/ (* liquid-tokens (var-get exchange-rate)) u1000000)
+)
+
+;; Private functions
+(define-private (calculate-protocol-fee (amount uint))
+    (/ (* amount PROTOCOL-FEE-RATE) u10000)
+)
+
+(define-private (update-exchange-rate (new-rewards uint))
+    (let (
+            (current-staked (var-get total-staked))
+            (current-liquid (var-get total-liquid-tokens))
+        )
+        (if (> current-liquid u0)
+            (let ((new-rate (/ (* (+ current-staked new-rewards) u1000000) current-liquid)))
+                (var-set exchange-rate new-rate)
+                (ok new-rate)
+            )
+            (ok (var-get exchange-rate))
+        )
+    )
+)

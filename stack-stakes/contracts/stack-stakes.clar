@@ -283,3 +283,329 @@
         )
     )
 )
+
+;; Unstaking functionality
+(define-public (initiate-unstaking
+        (validator principal)
+        (liquid-token-amount uint)
+    )
+    (let (
+            (user-stake (unwrap!
+                (map-get? user-stakes {
+                    user: tx-sender,
+                    validator: validator,
+                })
+                err-not-staking
+            ))
+            (stx-value (calculate-stx-value liquid-token-amount))
+            (request-id (var-get unstaking-counter))
+            (user-balance (get-liquid-token-balance tx-sender))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-not-authorized)
+            (asserts! (> liquid-token-amount u0) err-invalid-amount)
+            (asserts! (>= (get balance user-balance) liquid-token-amount)
+                err-insufficient-balance
+            )
+            (asserts! (is-none (get unstaking-height user-stake))
+                err-unstaking-period
+            )
+            ;; Create unstaking request
+            (map-set unstaking-requests {
+                user: tx-sender,
+                request-id: request-id,
+            } {
+                amount: stx-value,
+                liquid-tokens: liquid-token-amount,
+                initiated-height: stacks-block-height,
+                completed: false,
+            })
+            ;; Update user stake with unstaking height
+            (map-set user-stakes {
+                user: tx-sender,
+                validator: validator,
+            }
+                (merge user-stake { unstaking-height: (some stacks-block-height) })
+            )
+            ;; Update liquid token balance
+            (map-set liquid-token-balances tx-sender {
+                balance: (- (get balance user-balance) liquid-token-amount),
+                last-claim-cycle: (get last-claim-cycle user-balance),
+            })
+            (var-set unstaking-counter (+ request-id u1))
+            (ok request-id)
+        )
+    )
+)
+
+(define-public (complete-unstaking (request-id uint))
+    (let ((request (unwrap!
+            (map-get? unstaking-requests {
+                user: tx-sender,
+                request-id: request-id,
+            })
+            err-pool-not-found
+        )))
+        (begin
+            (asserts! (not (get completed request)) err-not-authorized)
+            (asserts!
+                (>= stacks-block-height
+                    (+ (get initiated-height request) UNSTAKING-PERIOD)
+                )
+                err-unstaking-period
+            )
+            ;; Transfer STX back to user
+            (unwrap!
+                (as-contract (stx-transfer? (get amount request) tx-sender tx-sender))
+                err-insufficient-balance
+            )
+            ;; Mark request as completed
+            (map-set unstaking-requests {
+                user: tx-sender,
+                request-id: request-id,
+            }
+                (merge request { completed: true })
+            )
+            ;; Update global stats
+            (var-set total-staked (- (var-get total-staked) (get amount request)))
+            (var-set total-liquid-tokens
+                (- (var-get total-liquid-tokens) (get liquid-tokens request))
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Rewards distribution and claiming
+(define-public (distribute-rewards
+        (validator principal)
+        (rewards-amount uint)
+    )
+    (let (
+            (pool (unwrap! (map-get? staking-pools validator) err-pool-not-found))
+            (commission (/ (* rewards-amount (get commission-rate pool)) u10000))
+            (net-rewards (- rewards-amount commission))
+        )
+        (begin
+            (asserts! (is-eq tx-sender validator) err-not-authorized)
+            (asserts! (get active pool) err-invalid-validator)
+            (asserts! (> rewards-amount u0) err-invalid-amount)
+            ;; Update pool with validator commission
+            (map-set staking-pools validator
+                (merge pool {
+                    validator-rewards: (+ (get validator-rewards pool) commission),
+                    last-reward-cycle: (var-get current-cycle),
+                })
+            )
+            ;; Update exchange rate with net rewards
+            (unwrap! (update-exchange-rate net-rewards) err-not-authorized)
+            ;; Update total staked to reflect rewards
+            (var-set total-staked (+ (var-get total-staked) net-rewards))
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-validator-rewards)
+    (let (
+            (pool (unwrap! (map-get? staking-pools tx-sender) err-pool-not-found))
+            (rewards (get validator-rewards pool))
+        )
+        (begin
+            (asserts! (> rewards u0) err-invalid-amount)
+            ;; Transfer validator rewards
+            (unwrap! (as-contract (stx-transfer? rewards tx-sender tx-sender))
+                err-insufficient-balance
+            )
+            ;; Reset validator rewards
+            (map-set staking-pools tx-sender
+                (merge pool { validator-rewards: u0 })
+            )
+            (ok rewards)
+        )
+    )
+)
+
+(define-public (claim-staking-rewards (validator principal))
+    (let (
+            (user-stake (unwrap!
+                (map-get? user-stakes {
+                    user: tx-sender,
+                    validator: validator,
+                })
+                err-not-staking
+            ))
+            (current-value (calculate-stx-value (get liquid-tokens user-stake)))
+            (original-stake (get stx-amount user-stake))
+            (rewards (if (> current-value original-stake)
+                (- current-value original-stake)
+                u0
+            ))
+        )
+        (begin
+            (asserts! (> rewards u0) err-invalid-amount)
+            ;; Auto-compound by converting rewards to liquid tokens
+            (let ((additional-liquid-tokens (calculate-liquid-tokens rewards)))
+                (map-set user-stakes {
+                    user: tx-sender,
+                    validator: validator,
+                }
+                    (merge user-stake {
+                        liquid-tokens: (+ (get liquid-tokens user-stake)
+                            additional-liquid-tokens
+                        ),
+                        rewards-claimed: (+ (get rewards-claimed user-stake) rewards),
+                    })
+                )
+                ;; Update user liquid token balance
+                (let ((current-balance (get-liquid-token-balance tx-sender)))
+                    (map-set liquid-token-balances tx-sender {
+                        balance: (+ (get balance current-balance) additional-liquid-tokens),
+                        last-claim-cycle: (var-get current-cycle),
+                    })
+                )
+                (ok additional-liquid-tokens)
+            )
+        )
+    )
+)
+
+;; Liquid token transfer functionality
+(define-public (transfer-liquid-tokens
+        (recipient principal)
+        (amount uint)
+    )
+    (let (
+            (sender-balance (get-liquid-token-balance tx-sender))
+            (recipient-balance (get-liquid-token-balance recipient))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-not-authorized)
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (>= (get balance sender-balance) amount)
+                err-insufficient-balance
+            )
+            (asserts! (not (is-eq tx-sender recipient)) err-invalid-amount)
+            ;; Update sender balance
+            (map-set liquid-token-balances tx-sender {
+                balance: (- (get balance sender-balance) amount),
+                last-claim-cycle: (get last-claim-cycle sender-balance),
+            })
+            ;; Update recipient balance
+            (map-set liquid-token-balances recipient {
+                balance: (+ (get balance recipient-balance) amount),
+                last-claim-cycle: (var-get current-cycle),
+            })
+            (ok true)
+        )
+    )
+)
+
+;; Auto-compounding mechanism
+(define-public (auto-compound-rewards (validator principal))
+    (let (
+            (user-stake (unwrap!
+                (map-get? user-stakes {
+                    user: tx-sender,
+                    validator: validator,
+                })
+                err-not-staking
+            ))
+            (pool (unwrap! (map-get? staking-pools validator) err-pool-not-found))
+            (user-balance (get-liquid-token-balance tx-sender))
+            (cycles-since-claim (- (var-get current-cycle) (get last-claim-cycle user-balance)))
+        )
+        (begin
+            (asserts! (> cycles-since-claim u0) err-invalid-amount)
+            (asserts! (get active pool) err-invalid-validator)
+            ;; Calculate accumulated rewards based on cycles
+            (let (
+                    (current-value (calculate-stx-value (get liquid-tokens user-stake)))
+                    (reward-rate (/ u50 u10000)) ;; 0.5% per cycle
+                    (accumulated-rewards (/ (* current-value reward-rate cycles-since-claim) u1))
+                )
+                (if (> accumulated-rewards u0)
+                    (let ((additional-liquid-tokens (calculate-liquid-tokens accumulated-rewards)))
+                        ;; Update user stake
+                        (map-set user-stakes {
+                            user: tx-sender,
+                            validator: validator,
+                        }
+                            (merge user-stake {
+                                liquid-tokens: (+ (get liquid-tokens user-stake)
+                                    additional-liquid-tokens
+                                ),
+                                rewards-claimed: (+ (get rewards-claimed user-stake)
+                                    accumulated-rewards
+                                ),
+                            })
+                        )
+                        ;; Update liquid token balance
+                        (map-set liquid-token-balances tx-sender {
+                            balance: (+ (get balance user-balance)
+                                additional-liquid-tokens
+                            ),
+                            last-claim-cycle: (var-get current-cycle),
+                        })
+                        (ok additional-liquid-tokens)
+                    )
+                    (ok u0)
+                )
+            )
+        )
+    )
+)
+
+;; Read-only functions for rewards
+(define-read-only (get-unstaking-request
+        (user principal)
+        (request-id uint)
+    )
+    (map-get? unstaking-requests {
+        user: user,
+        request-id: request-id,
+    })
+)
+
+(define-read-only (calculate-pending-rewards
+        (user principal)
+        (validator principal)
+    )
+    (match (map-get? user-stakes {
+        user: user,
+        validator: validator,
+    })
+        stake (let (
+                (current-value (calculate-stx-value (get liquid-tokens stake)))
+                (original-stake (get stx-amount stake))
+            )
+            (ok (if (> current-value original-stake)
+                (- current-value original-stake)
+                u0
+            ))
+        )
+        (ok u0)
+    )
+)
+
+(define-read-only (get-user-yield
+        (user principal)
+        (validator principal)
+    )
+    (match (map-get? user-stakes {
+        user: user,
+        validator: validator,
+    })
+        stake (let (
+                (current-value (calculate-stx-value (get liquid-tokens stake)))
+                (original-stake (get stx-amount stake))
+                (yield-percentage (if (> original-stake u0)
+                    (/ (* (- current-value original-stake) u10000) original-stake)
+                    u0
+                ))
+            )
+            (ok yield-percentage)
+        )
+        (ok u0)
+    )
+)

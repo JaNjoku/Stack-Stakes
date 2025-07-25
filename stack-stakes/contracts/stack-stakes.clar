@@ -140,3 +140,146 @@
         )
     )
 )
+
+;; Validator management
+(define-public (register-validator (commission-rate uint))
+    (begin
+        (asserts! (not (var-get contract-paused)) err-not-authorized)
+        (asserts! (<= commission-rate u2000) err-invalid-amount) ;; Max 20% commission
+        (asserts! (is-none (map-get? staking-pools tx-sender))
+            err-already-staking
+        )
+        (map-set staking-pools tx-sender {
+            total-delegated: u0,
+            liquid-tokens-issued: u0,
+            active: true,
+            commission-rate: commission-rate,
+            validator-rewards: u0,
+            last-reward-cycle: (var-get current-cycle),
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-validator-commission (new-commission uint))
+    (let ((pool (unwrap! (map-get? staking-pools tx-sender) err-pool-not-found)))
+        (begin
+            (asserts! (<= new-commission u2000) err-invalid-amount)
+            (asserts! (get active pool) err-not-authorized)
+            (map-set staking-pools tx-sender
+                (merge pool { commission-rate: new-commission })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (deactivate-validator)
+    (let ((pool (unwrap! (map-get? staking-pools tx-sender) err-pool-not-found)))
+        (begin
+            (asserts! (get active pool) err-not-authorized)
+            (map-set staking-pools tx-sender (merge pool { active: false }))
+            (ok true)
+        )
+    )
+)
+
+;; Core staking functionality
+(define-public (stake-stx
+        (validator principal)
+        (amount uint)
+    )
+    (let (
+            (pool (unwrap! (map-get? staking-pools validator) err-pool-not-found))
+            (liquid-tokens (calculate-liquid-tokens amount))
+            (protocol-fee (calculate-protocol-fee amount))
+            (net-stake (- amount protocol-fee))
+            (existing-stake (map-get? user-stakes {
+                user: tx-sender,
+                validator: validator,
+            }))
+        )
+        (begin
+            (asserts! (not (var-get contract-paused)) err-not-authorized)
+            (asserts! (get active pool) err-invalid-validator)
+            (asserts! (>= amount MIN-STAKE-AMOUNT) err-invalid-amount)
+            (asserts! (>= (stx-get-balance tx-sender) amount)
+                err-insufficient-balance
+            )
+            ;; Transfer STX to contract
+            (unwrap! (stx-transfer? amount tx-sender (as-contract tx-sender))
+                err-insufficient-balance
+            )
+            ;; Update or create user stake
+            (match existing-stake
+                stake (map-set user-stakes {
+                    user: tx-sender,
+                    validator: validator,
+                }
+                    (merge stake {
+                        stx-amount: (+ (get stx-amount stake) net-stake),
+                        liquid-tokens: (+ (get liquid-tokens stake) liquid-tokens),
+                    })
+                )
+                (map-set user-stakes {
+                    user: tx-sender,
+                    validator: validator,
+                } {
+                    stx-amount: net-stake,
+                    liquid-tokens: liquid-tokens,
+                    stake-height: stacks-block-height,
+                    unstaking-height: none,
+                    rewards-claimed: u0,
+                })
+            )
+            ;; Update pool stats
+            (map-set staking-pools validator
+                (merge pool {
+                    total-delegated: (+ (get total-delegated pool) net-stake),
+                    liquid-tokens-issued: (+ (get liquid-tokens-issued pool) liquid-tokens),
+                })
+            )
+            ;; Update liquid token balance
+            (let ((current-balance (get-liquid-token-balance tx-sender)))
+                (map-set liquid-token-balances tx-sender {
+                    balance: (+ (get balance current-balance) liquid-tokens),
+                    last-claim-cycle: (var-get current-cycle),
+                })
+            )
+            ;; Update global stats
+            (var-set total-staked (+ (var-get total-staked) net-stake))
+            (var-set total-liquid-tokens
+                (+ (var-get total-liquid-tokens) liquid-tokens)
+            )
+            (var-set protocol-fees (+ (var-get protocol-fees) protocol-fee))
+            (ok liquid-tokens)
+        )
+    )
+)
+
+;; Administrative functions
+(define-public (update-current-cycle (new-cycle uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set current-cycle new-cycle)
+        (ok true)
+    )
+)
+
+(define-public (toggle-contract-pause)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set contract-paused (not (var-get contract-paused)))
+        (ok true)
+    )
+)
+
+(define-public (withdraw-protocol-fees)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (let ((fees (var-get protocol-fees)))
+            (var-set protocol-fees u0)
+            (as-contract (stx-transfer? fees tx-sender contract-owner))
+        )
+    )
+)
